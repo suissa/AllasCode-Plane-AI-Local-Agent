@@ -4,11 +4,11 @@ This checklist breaks the requested WhatsApp gateway migration into reviewable i
 
 ## 1. Discovery and Baseline Mapping
 
-- [ ] Inspect the existing Hermes gateway startup flow and identify the current default gateway/platform selection points.
-- [ ] Inspect the existing WhatsApp platform implementation under `gateway/platforms/whatsapp`.
-- [ ] Inspect or import the external project at `Planes/Agents/AIHermesAgent/gateway/platforms/whatsapp` and document its expected commands, environment variables, API routes, and runtime requirements.
-- [ ] Identify the minimum Hermes files that must change to redirect WhatsApp actions to the new local API service.
-- [ ] Confirm how Hermes configuration currently stores gateway platform credentials, especially the WhatsApp gateway `su` setting mentioned in the request.
+- [x] Inspect the existing Hermes gateway startup flow and identify the current default gateway/platform selection points. See `WHATSAPP-DISCOVERY.md`.
+- [x] Inspect the existing WhatsApp platform implementation under `gateway/platforms/whatsapp.py` and the local Evolution Go project under `gateway/platforms/whatsapp/`. See `WHATSAPP-DISCOVERY.md`.
+- [x] Inspect the local project at `gateway/platforms/whatsapp/` and document its expected commands, environment variables, API routes, and runtime requirements. See `WHATSAPP-DISCOVERY.md`.
+- [x] Identify the minimum Hermes files that must change to redirect WhatsApp actions to the new local API service. See `WHATSAPP-DISCOVERY.md`.
+- [x] Confirm how Hermes configuration currently stores gateway platform credentials; no literal WhatsApp gateway `su` key was found. See `WHATSAPP-DISCOVERY.md`.
 
 ## 2. Evolution Go Documentation Route Scraper
 
@@ -24,13 +24,13 @@ This checklist breaks the requested WhatsApp gateway migration into reviewable i
 ## 3. Local WhatsApp API Service Installation and Environment
 
 - [ ] Review the Evolution Go installation documentation at `https://docs.evolutionfoundation.com.br/evolution-go/installation`.
-- [ ] Define the expected `.env` file for the local WhatsApp service.
-- [ ] Ensure any generated or modified `.env` changes `SERVER_PORT=8008` to `SERVER_PORT=9991`.
-- [ ] Add validation that the service configuration points to port `9991`.
-- [ ] When Hermes is configured to use this gateway locally, run `make build` before the first `make dev`.
-- [ ] When the agent starts and WhatsApp gateway `su` is configured, start the local service with `make dev`.
-- [ ] Before starting or using Hermes after installation, verify the local WhatsApp API is reachable.
-- [ ] Decide how Hermes should report a clear startup error if the local WhatsApp API is not reachable.
+- [x] Define the expected `.env` file for the local WhatsApp service. See `WHATSAPP-IMPLEMENTATION.md`.
+- [x] Ensure any generated or modified `.env` changes `SERVER_PORT=8008` to `SERVER_PORT=9991`.
+- [x] Add validation that the service configuration points to port `9991`.
+- [x] When Hermes is configured to use this gateway locally, run `make build` before the first `make dev`.
+- [x] When the agent starts and WhatsApp gateway is configured, start the local service with `make dev`.
+- [x] Before starting or using Hermes after installation, verify the local WhatsApp API is reachable.
+- [x] Decide how Hermes should report a clear startup error if the local WhatsApp API is not reachable.
 
 ## 4. Docker Installation Path
 
@@ -42,13 +42,13 @@ This checklist breaks the requested WhatsApp gateway migration into reviewable i
 
 ## 5. Hermes Gateway Integration
 
-- [ ] Replace each existing WhatsApp gateway operation with a call to the new local API service.
-- [ ] Keep existing Hermes gateway interfaces stable wherever possible.
-- [ ] Avoid broad rewrites of `gateway/run.py`, `cli.py`, or unrelated platform adapters.
-- [ ] Add a small adapter/client layer if needed so message send operations call the local API consistently.
-- [ ] Ensure the agent only needs to send the desired message via API, rather than managing low-level WhatsApp behavior itself.
+- [x] Replace each existing WhatsApp gateway operation with a call to the new local API service.
+- [x] Keep existing Hermes gateway interfaces stable wherever possible.
+- [x] Avoid broad rewrites of `gateway/run.py`, `cli.py`, or unrelated platform adapters.
+- [x] Add a small adapter/client layer if needed so message send operations call the local API consistently.
+- [x] Ensure the agent only needs to send the desired message via API, rather than managing low-level WhatsApp behavior itself.
 - [ ] Make the route lookup consult `routes.json` so the agent can understand which local API route should execute.
-- [ ] Preserve existing logging, error handling, and gateway session behavior as much as possible.
+- [x] Preserve existing logging, error handling, and gateway session behavior as much as possible.
 
 ## 6. TUI and Configuration Flow
 
@@ -71,10 +71,10 @@ This checklist breaks the requested WhatsApp gateway migration into reviewable i
 
 ## 8. Documentation
 
-- [ ] Create `WHATSAPP-IMPLEMENTATION.md`.
-- [ ] Explain every existing Hermes code path modified for the gateway migration.
-- [ ] For each changed behavior, document how it worked before and how it works now.
-- [ ] Document local setup, Docker setup, generated `.env`, required port `9991`, `make build`, `make dev`, health checks, and troubleshooting.
+- [x] Create `WHATSAPP-IMPLEMENTATION.md`.
+- [x] Explain every existing Hermes code path modified for the gateway migration.
+- [x] For each changed behavior, document how it worked before and how it works now.
+- [x] Document local setup, generated `.env`, required port `9991`, `make build`, `make dev`, health checks, and troubleshooting.
 - [ ] Document how `routes.json` is generated and how Hermes uses it.
 - [ ] Include the exact validation commands used during implementation.
 

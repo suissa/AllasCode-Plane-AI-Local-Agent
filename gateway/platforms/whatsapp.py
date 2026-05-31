@@ -16,6 +16,7 @@ with different backends via a bridge pattern.
 """
 
 import asyncio
+import base64
 import json
 import logging
 import os
@@ -191,15 +192,8 @@ from gateway.platforms.base import (
 )
 
 
-def check_whatsapp_requirements() -> bool:
-    """
-    Check if WhatsApp dependencies are available.
-    
-    WhatsApp requires a Node.js bridge for most implementations.
-    """
-    # Check for Node.js.  Resolve via shutil.which so we respect PATHEXT
-    # (node.exe vs node) and get a meaningful "not installed" signal
-    # instead of spawning a cmd flash on Windows.
+def _check_node_requirements() -> bool:
+    """Return True when the legacy Node.js bridge can be executed."""
     _node = shutil.which("node")
     if not _node:
         return False
@@ -208,9 +202,23 @@ def check_whatsapp_requirements() -> bool:
             [_node, "--version"],
             capture_output=True,
             text=True,
-            timeout=5
+            timeout=5,
         )
         return result.returncode == 0
+    except Exception:
+        return False
+
+
+def check_whatsapp_requirements() -> bool:
+    """Check if the WhatsApp adapter's Python-side dependencies exist.
+
+    The default WhatsApp backend is the local Evolution Go API service.  The
+    legacy Node.js bridge is still available behind ``backend=bridge`` and
+    performs its own Node.js preflight inside ``connect()``.
+    """
+    try:
+        import aiohttp  # noqa: F401
+        return True
     except Exception:
         return False
 
@@ -249,12 +257,71 @@ class WhatsAppAdapter(BasePlatformAdapter):
 
     def __init__(self, config: PlatformConfig):
         super().__init__(config, Platform.WHATSAPP)
+        backend = (
+            config.extra.get("backend")
+            or config.extra.get("implementation")
+            or os.getenv("WHATSAPP_GATEWAY_BACKEND")
+            or "evolution"
+        )
+        self._backend = str(backend).strip().lower()
+
         self._bridge_process: Optional[subprocess.Popen] = None
-        self._bridge_port: int = config.extra.get("bridge_port", 3000)
+        self._bridge_port: int = int(config.extra.get("bridge_port", 3000))
         self._bridge_script: Optional[str] = config.extra.get(
             "bridge_script",
             str(self._DEFAULT_BRIDGE_DIR / "bridge.js"),
         )
+
+        self._evolution_dir: Path = Path(config.extra.get(
+            "service_path",
+            Path(__file__).resolve().parent / "whatsapp",
+        ))
+        self._evolution_port: int = int(
+            config.extra.get("service_port")
+            or os.getenv("WHATSAPP_EVOLUTION_PORT")
+            or 9991
+        )
+        self._evolution_base_url: str = str(
+            config.extra.get("api_base_url")
+            or os.getenv("WHATSAPP_EVOLUTION_API_BASE_URL")
+            or f"http://127.0.0.1:{self._evolution_port}"
+        ).rstrip("/")
+        self._evolution_api_key: str = str(
+            config.extra.get("api_key")
+            or os.getenv("WHATSAPP_EVOLUTION_API_KEY")
+            or os.getenv("EVOLUTION_GLOBAL_API_KEY")
+            or os.getenv("GLOBAL_API_KEY")
+            or ""
+        )
+        self._evolution_instance_id: str = str(
+            config.extra.get("instance_id")
+            or os.getenv("WHATSAPP_EVOLUTION_INSTANCE_ID")
+            or "hermes"
+        )
+        self._evolution_instance_name: str = str(
+            config.extra.get("instance_name")
+            or os.getenv("WHATSAPP_EVOLUTION_INSTANCE_NAME")
+            or self._evolution_instance_id
+        )
+        self._evolution_instance_token: str = str(
+            config.extra.get("instance_token")
+            or os.getenv("WHATSAPP_EVOLUTION_INSTANCE_TOKEN")
+            or self._evolution_api_key
+            or ""
+        )
+        self._evolution_auto_start = self._coerce_bool_extra("auto_start", True)
+        self._evolution_build_on_start = self._coerce_bool_extra("build_on_start", True)
+        self._evolution_webhook_host = str(config.extra.get("webhook_host") or "127.0.0.1")
+        self._evolution_webhook_port = int(config.extra.get("webhook_port") or 9992)
+        self._evolution_webhook_path = str(config.extra.get("webhook_path") or "/webhook/evolution")
+        self._evolution_webhook_url = str(
+            config.extra.get("webhook_url")
+            or f"http://127.0.0.1:{self._evolution_webhook_port}{self._evolution_webhook_path}"
+        )
+        self._evolution_process: Optional[subprocess.Popen] = None
+        self._evolution_log_fh = None
+        self._webhook_runner = None
+        self._webhook_site = None
         self._session_path: Path = Path(config.extra.get(
             "session_path",
             get_hermes_dir("platforms/whatsapp/session", "whatsapp/session")
@@ -314,6 +381,332 @@ class WhatsAppAdapter(BasePlatformAdapter):
         if not math.isfinite(parsed) or parsed < 0:
             return float(default)
         return parsed
+
+    @staticmethod
+    def _coerce_bool_value(value: Any, default: bool = False) -> bool:
+        if value is None:
+            return default
+        if isinstance(value, str):
+            return value.strip().lower() in {"1", "true", "yes", "on"}
+        return bool(value)
+
+    def _coerce_bool_extra(self, key: str, default: bool = False) -> bool:
+        return self._coerce_bool_value(self.config.extra.get(key), default)
+
+    def _load_evolution_env_values(self) -> Dict[str, str]:
+        env_path = self._evolution_dir / ".env"
+        values: Dict[str, str] = {}
+        try:
+            for line in env_path.read_text(encoding="utf-8").splitlines():
+                stripped = line.strip()
+                if not stripped or stripped.startswith("#") or "=" not in stripped:
+                    continue
+                key, value = stripped.split("=", 1)
+                values[key.strip()] = value.strip().strip('"').strip("'")
+        except OSError:
+            pass
+        return values
+
+    def _ensure_evolution_env(self) -> None:
+        """Ensure Evolution Go has a .env and force SERVER_PORT=9991 by default."""
+        self._evolution_dir.mkdir(parents=True, exist_ok=True)
+        env_path = self._evolution_dir / ".env"
+        if not env_path.exists():
+            example = self._evolution_dir / ".env.example"
+            if example.exists():
+                env_path.write_text(example.read_text(encoding="utf-8"), encoding="utf-8")
+            else:
+                env_path.write_text("", encoding="utf-8")
+
+        lines = env_path.read_text(encoding="utf-8").splitlines()
+        output = []
+        saw_port = False
+        saw_global_key = False
+        saw_database_save = False
+        for line in lines:
+            if line.startswith("SERVER_PORT="):
+                output.append(f"SERVER_PORT={self._evolution_port}")
+                saw_port = True
+            elif line.startswith("GLOBAL_API_KEY="):
+                saw_global_key = True
+                output.append(line)
+            elif line.startswith("DATABASE_SAVE_MESSAGES="):
+                saw_database_save = True
+                output.append(line)
+            else:
+                output.append(line)
+        if not saw_port:
+            output.insert(0, f"SERVER_PORT={self._evolution_port}")
+        if not saw_database_save:
+            output.append("DATABASE_SAVE_MESSAGES=false")
+        if not saw_global_key and self._evolution_api_key:
+            output.append(f"GLOBAL_API_KEY={self._evolution_api_key}")
+        env_path.write_text("\n".join(output).rstrip() + "\n", encoding="utf-8")
+
+        env_values = self._load_evolution_env_values()
+        if not self._evolution_api_key:
+            self._evolution_api_key = env_values.get("GLOBAL_API_KEY", "")
+        if not self._evolution_instance_token:
+            self._evolution_instance_token = self._evolution_api_key
+
+    async def connect(self) -> bool:
+        """Connect the WhatsApp adapter using Evolution Go by default."""
+        if getattr(self, "_backend", "bridge") in {"bridge", "node", "legacy"}:
+            return await self._connect_bridge()
+        return await self._connect_evolution()
+
+    async def _connect_evolution(self) -> bool:
+        """Start/verify the Evolution Go API and prepare Hermes webhook intake."""
+        if not check_whatsapp_requirements():
+            self._set_fatal_error(
+                "whatsapp_aiohttp_missing",
+                "aiohttp is not installed; cannot use the Evolution Go WhatsApp API backend.",
+                retryable=False,
+            )
+            return False
+
+        self._ensure_evolution_env()
+        if not self._evolution_api_key:
+            self._set_fatal_error(
+                "whatsapp_evolution_api_key_missing",
+                "Evolution Go GLOBAL_API_KEY is missing; set WHATSAPP_EVOLUTION_API_KEY or gateway.platforms.whatsapp.extra.api_key.",
+                retryable=False,
+            )
+            return False
+
+        import aiohttp
+
+        await self._start_evolution_webhook_server()
+        self._http_session = aiohttp.ClientSession()
+
+        if not await self._evolution_healthcheck():
+            if not self._evolution_auto_start:
+                self._set_fatal_error(
+                    "whatsapp_evolution_unreachable",
+                    f"Evolution Go API is not reachable at {self._evolution_base_url}.",
+                    retryable=True,
+                )
+                await self._disconnect_evolution()
+                return False
+            if not await self._start_evolution_service():
+                await self._disconnect_evolution()
+                return False
+
+        if not await self._ensure_evolution_instance():
+            await self._disconnect_evolution()
+            return False
+
+        self._mark_connected()
+        print(f"[{self.name}] Evolution Go API ready at {self._evolution_base_url}")
+        return True
+
+    async def _evolution_healthcheck(self) -> bool:
+        import aiohttp
+        try:
+            async with self._http_session.get(
+                f"{self._evolution_base_url}/server/ok",
+                timeout=aiohttp.ClientTimeout(total=2),
+            ) as resp:
+                return 200 <= resp.status < 300
+        except Exception:
+            return False
+
+    async def _start_evolution_service(self) -> bool:
+        """Run make build then make dev for the bundled Evolution Go service."""
+        if not self._evolution_dir.exists():
+            self._set_fatal_error(
+                "whatsapp_evolution_missing",
+                f"Evolution Go project not found at {self._evolution_dir}.",
+                retryable=False,
+            )
+            return False
+
+        try:
+            if self._evolution_build_on_start:
+                build = subprocess.run(
+                    ["make", "build"],
+                    cwd=str(self._evolution_dir),
+                    capture_output=True,
+                    text=True,
+                    timeout=int(os.getenv("WHATSAPP_EVOLUTION_BUILD_TIMEOUT", "300")),
+                )
+                if build.returncode != 0:
+                    self._set_fatal_error(
+                        "whatsapp_evolution_build_failed",
+                        f"make build failed for Evolution Go: {build.stderr or build.stdout}",
+                        retryable=False,
+                    )
+                    return False
+
+            log_path = self._session_path.parent / "evolution-go.log"
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+            self._evolution_log_fh = open(log_path, "a", encoding="utf-8")
+            self._evolution_process = subprocess.Popen(
+                ["make", "dev"],
+                cwd=str(self._evolution_dir),
+                stdout=self._evolution_log_fh,
+                stderr=self._evolution_log_fh,
+                preexec_fn=None if _IS_WINDOWS else os.setsid,
+                env=os.environ.copy(),
+            )
+
+            for _ in range(int(os.getenv("WHATSAPP_EVOLUTION_START_TIMEOUT", "60"))):
+                await asyncio.sleep(1)
+                if self._evolution_process.poll() is not None:
+                    self._set_fatal_error(
+                        "whatsapp_evolution_exited",
+                        f"Evolution Go exited during startup; check {log_path}.",
+                        retryable=True,
+                    )
+                    return False
+                if await self._evolution_healthcheck():
+                    return True
+
+            self._set_fatal_error(
+                "whatsapp_evolution_timeout",
+                f"Evolution Go did not become ready at {self._evolution_base_url}; check {log_path}.",
+                retryable=True,
+            )
+            return False
+        except Exception as exc:
+            self._set_fatal_error(
+                "whatsapp_evolution_start_failed",
+                f"Failed to start Evolution Go: {exc}",
+                retryable=True,
+            )
+            return False
+
+    def _evolution_headers(self, *, admin: bool = False) -> Dict[str, str]:
+        token = self._evolution_api_key if admin else self._evolution_instance_token
+        return {"apikey": token, "Content-Type": "application/json"}
+
+    async def _evolution_request(self, method: str, path: str, *, json_data: Optional[Dict[str, Any]] = None, admin: bool = False, timeout: int = 30) -> tuple[int, Any]:
+        import aiohttp
+        async with self._http_session.request(
+            method,
+            f"{self._evolution_base_url}{path}",
+            json=json_data,
+            headers=self._evolution_headers(admin=admin),
+            timeout=aiohttp.ClientTimeout(total=timeout),
+        ) as resp:
+            text = await resp.text()
+            try:
+                return resp.status, json.loads(text) if text else {}
+            except json.JSONDecodeError:
+                return resp.status, text
+
+    async def _ensure_evolution_instance(self) -> bool:
+        create_payload = {
+            "instanceId": self._evolution_instance_id,
+            "name": self._evolution_instance_name,
+            "token": self._evolution_instance_token,
+        }
+        status, body = await self._evolution_request("POST", "/instance/create", json_data=create_payload, admin=True, timeout=30)
+        if status not in {200, 201, 409}:
+            body_text = str(body)
+            if "already" not in body_text.lower() and "exist" not in body_text.lower():
+                self._set_fatal_error(
+                    "whatsapp_evolution_instance_create_failed",
+                    f"Could not create Evolution Go instance {self._evolution_instance_id}: {body_text}",
+                    retryable=False,
+                )
+                return False
+
+        connect_payload = {
+            "webhookUrl": self._evolution_webhook_url,
+            "subscribe": ["MESSAGE", "GROUP"],
+            "immediate": True,
+        }
+        phone = str(self.config.extra.get("pair_phone") or os.getenv("WHATSAPP_EVOLUTION_PAIR_PHONE") or "")
+        if phone:
+            connect_payload["phone"] = phone
+        status, body = await self._evolution_request("POST", "/instance/connect", json_data=connect_payload, timeout=30)
+        if status >= 400:
+            logger.warning("[%s] Evolution Go instance connect returned %s: %s", self.name, status, body)
+        return True
+
+    async def _start_evolution_webhook_server(self) -> None:
+        if self._webhook_runner is not None:
+            return
+        from aiohttp import web
+
+        app = web.Application()
+        app.router.add_post(self._evolution_webhook_path, self._handle_evolution_webhook)
+        runner = web.AppRunner(app)
+        await runner.setup()
+        site = web.TCPSite(runner, self._evolution_webhook_host, self._evolution_webhook_port)
+        await site.start()
+        self._webhook_runner = runner
+        self._webhook_site = site
+
+    async def _handle_evolution_webhook(self, request):
+        from aiohttp import web
+        try:
+            payload = await request.json()
+        except Exception:
+            return web.json_response({"ok": False, "error": "invalid json"}, status=400)
+
+        event = await self._build_evolution_message_event(payload)
+        if event is not None:
+            if event.message_type == MessageType.TEXT:
+                self._enqueue_text_event(event)
+            else:
+                await self.handle_message(event)
+        return web.json_response({"ok": True})
+
+    async def _build_evolution_message_event(self, payload: Dict[str, Any]) -> Optional[MessageEvent]:
+        if str(payload.get("event") or "").lower() not in {"message", "messages.upsert", "buttonclick"}:
+            return None
+        data = payload.get("data") if isinstance(payload.get("data"), dict) else payload
+        info = data.get("Info") if isinstance(data.get("Info"), dict) else data.get("info") if isinstance(data.get("info"), dict) else {}
+        if self._coerce_bool_value(info.get("IsFromMe") if "IsFromMe" in info else info.get("fromMe"), False):
+            return None
+
+        message = data.get("Message") if isinstance(data.get("Message"), dict) else data.get("message") if isinstance(data.get("message"), dict) else {}
+        extended = message.get("extendedTextMessage") if isinstance(message.get("extendedTextMessage"), dict) else {}
+        body = (
+            data.get("body") or data.get("Body") or data.get("text") or data.get("Text")
+            or message.get("conversation")
+            or extended.get("text")
+            or ""
+        )
+        chat_id = str(info.get("Chat") or info.get("chat") or data.get("Chat") or data.get("chat") or "")
+        sender_id = str(info.get("Sender") or info.get("sender") or data.get("Sender") or data.get("sender") or chat_id)
+        sender_name = str(data.get("PushName") or data.get("pushName") or data.get("senderName") or "")
+        message_id = str(info.get("ID") or info.get("id") or data.get("ID") or data.get("id") or data.get("messageId") or "")
+        is_group = chat_id.endswith("@g.us") or self._coerce_bool_value(info.get("IsGroup") or data.get("isGroup"), False)
+
+        media_urls = []
+        media_type = ""
+        for key in ("mediaUrl", "url", "URL", "base64"):
+            value = message.get(key) or data.get(key)
+            if isinstance(value, str) and value:
+                media_urls.append(value)
+                break
+        if message.get("imageMessage") or data.get("imageMessage"):
+            media_type = "image/jpeg"
+        elif message.get("videoMessage") or data.get("videoMessage"):
+            media_type = "video/mp4"
+        elif message.get("audioMessage") or data.get("audioMessage"):
+            media_type = "audio/ogg"
+        elif message.get("documentMessage") or data.get("documentMessage"):
+            media_type = "application/octet-stream"
+        elif media_urls:
+            media_type = str(data.get("mimetype") or message.get("mimetype") or "application/octet-stream")
+
+        bridge_like = {
+            "chatId": chat_id,
+            "chatName": str(data.get("chatName") or data.get("ChatName") or chat_id),
+            "senderId": sender_id,
+            "senderName": sender_name,
+            "body": str(body or ""),
+            "messageId": message_id,
+            "isGroup": is_group,
+            "hasMedia": bool(media_urls),
+            "mediaType": media_type,
+            "mediaUrls": media_urls,
+        }
+        return await self._build_message_event(bridge_like)
 
     def _effective_reply_prefix(self) -> str:
         """Return the prefix the Node bridge will add in self-chat mode."""
@@ -522,13 +915,13 @@ class WhatsAppAdapter(BasePlatformAdapter):
             return True
         return self._message_matches_mention_patterns(data)
     
-    async def connect(self) -> bool:
+    async def _connect_bridge(self) -> bool:
         """
-        Start the WhatsApp bridge.
-        
+        Start the legacy WhatsApp Node.js bridge.
+
         This launches the Node.js bridge process and waits for it to be ready.
         """
-        if not check_whatsapp_requirements():
+        if not _check_node_requirements():
             logger.warning("[%s] Node.js not found. WhatsApp requires Node.js.", self.name)
             self._set_fatal_error(
                 "whatsapp_node_missing",
@@ -794,8 +1187,56 @@ class WhatsAppAdapter(BasePlatformAdapter):
             await self._notify_fatal_error()
         return self.fatal_error_message or message
 
+    async def _disconnect_evolution(self) -> None:
+        """Stop webhook intake and any Evolution Go process managed by Hermes."""
+        self._shutting_down = True
+        for task in list(self._pending_text_batch_tasks.values()):
+            if task and not task.done():
+                task.cancel()
+                try:
+                    await task
+                except (asyncio.CancelledError, Exception):
+                    pass
+        self._pending_text_batch_tasks.clear()
+        self._pending_text_batches.clear()
+
+        if self._webhook_runner is not None:
+            try:
+                await self._webhook_runner.cleanup()
+            except Exception:
+                logger.debug("[%s] Evolution webhook cleanup failed", self.name, exc_info=True)
+            self._webhook_runner = None
+            self._webhook_site = None
+
+        if self._http_session and not self._http_session.closed:
+            await self._http_session.close()
+        self._http_session = None
+
+        if self._evolution_process is not None:
+            try:
+                _terminate_bridge_process(self._evolution_process, force=False)
+                await asyncio.sleep(1)
+                if self._evolution_process.poll() is None:
+                    _terminate_bridge_process(self._evolution_process, force=True)
+            except Exception as exc:
+                logger.debug("[%s] Error stopping Evolution Go: %s", self.name, exc)
+            self._evolution_process = None
+
+        if self._evolution_log_fh:
+            try:
+                self._evolution_log_fh.close()
+            except Exception:
+                pass
+            self._evolution_log_fh = None
+
+        self._mark_disconnected()
+
     async def disconnect(self) -> None:
-        """Stop the WhatsApp bridge and clean up any orphaned processes."""
+        """Stop the WhatsApp backend and clean up any orphaned processes."""
+        if getattr(self, "_backend", "bridge") not in {"bridge", "node", "legacy"}:
+            await self._disconnect_evolution()
+            return
+
         # Flip the shutdown flag BEFORE signalling the child so the exit-check
         # path (which runs from other tasks like send() and the poll loop)
         # doesn't race us and report the intentional termination as fatal.
@@ -902,6 +1343,112 @@ class WhatsAppAdapter(BasePlatformAdapter):
 
         return result
 
+    def _evolution_message_id(self, data: Any) -> Optional[str]:
+        if not isinstance(data, dict):
+            return None
+        candidates = [
+            data.get("messageId"),
+            data.get("id"),
+        ]
+        nested = data.get("data")
+        if isinstance(nested, dict):
+            candidates.extend([nested.get("messageId"), nested.get("id")])
+            info = nested.get("Info") or nested.get("info")
+            if isinstance(info, dict):
+                candidates.extend([info.get("ID"), info.get("id")])
+        for candidate in candidates:
+            if candidate:
+                return str(candidate)
+        return None
+
+    async def _send_evolution_text(
+        self,
+        chat_id: str,
+        content: str,
+        reply_to: Optional[str] = None,
+    ) -> SendResult:
+        if not self._running or not self._http_session:
+            return SendResult(success=False, error="Not connected")
+        if not content or not content.strip():
+            return SendResult(success=True, message_id=None)
+        try:
+            formatted = self.format_message(content)
+            chunks = self.truncate_message(formatted, self._outgoing_chunk_limit())
+            last_message_id = None
+            for chunk in chunks:
+                payload: Dict[str, Any] = {
+                    "number": chat_id,
+                    "text": chunk,
+                    "formatJid": False,
+                }
+                if reply_to and last_message_id is None:
+                    payload["quoted"] = {"messageId": reply_to}
+                status, data = await self._evolution_request(
+                    "POST", "/send/text", json_data=payload, timeout=30,
+                )
+                if not (200 <= status < 300):
+                    return SendResult(success=False, error=str(data))
+                last_message_id = self._evolution_message_id(data) or last_message_id
+                if len(chunks) > 1:
+                    await asyncio.sleep(0.3)
+            return SendResult(success=True, message_id=last_message_id)
+        except Exception as exc:
+            return SendResult(success=False, error=str(exc))
+
+    async def _edit_evolution_message(self, chat_id: str, message_id: str, content: str) -> SendResult:
+        if not self._running or not self._http_session:
+            return SendResult(success=False, error="Not connected")
+        try:
+            status, data = await self._evolution_request(
+                "POST",
+                "/message/edit",
+                json_data={"chat": chat_id, "messageId": message_id, "message": content},
+                timeout=15,
+            )
+            if 200 <= status < 300:
+                return SendResult(success=True, message_id=message_id)
+            return SendResult(success=False, error=str(data))
+        except Exception as exc:
+            return SendResult(success=False, error=str(exc))
+
+    async def _send_media_to_evolution(
+        self,
+        chat_id: str,
+        file_path: str,
+        media_type: str,
+        caption: Optional[str] = None,
+        file_name: Optional[str] = None,
+    ) -> SendResult:
+        if not self._running or not self._http_session:
+            return SendResult(success=False, error="Not connected")
+        try:
+            if file_path.startswith(("http://", "https://")):
+                media_value = file_path
+            else:
+                if not os.path.exists(file_path):
+                    return SendResult(success=False, error=f"File not found: {file_path}")
+                media_value = base64.b64encode(Path(file_path).read_bytes()).decode("ascii")
+            payload: Dict[str, Any] = {
+                "number": chat_id,
+                "url": media_value,
+                "type": media_type,
+                "caption": caption or "",
+                "filename": file_name or os.path.basename(file_path),
+                "formatJid": False,
+            }
+            status, data = await self._evolution_request(
+                "POST", "/send/media", json_data=payload, timeout=120,
+            )
+            if 200 <= status < 300:
+                return SendResult(
+                    success=True,
+                    message_id=self._evolution_message_id(data),
+                    raw_response=data,
+                )
+            return SendResult(success=False, error=str(data))
+        except Exception as exc:
+            return SendResult(success=False, error=str(exc))
+
     async def send(
         self,
         chat_id: str,
@@ -909,11 +1456,14 @@ class WhatsAppAdapter(BasePlatformAdapter):
         reply_to: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None
     ) -> SendResult:
-        """Send a message via the WhatsApp bridge.
+        """Send a message via the active WhatsApp backend.
 
         Formats markdown for WhatsApp, splits long messages into chunks
         that preserve code block boundaries, and sends each chunk sequentially.
         """
+        if getattr(self, "_backend", "bridge") not in {"bridge", "node", "legacy"}:
+            return await self._send_evolution_text(chat_id, content, reply_to)
+
         if not self._running or not self._http_session:
             return SendResult(success=False, error="Not connected")
         bridge_exit = await self._check_managed_bridge_exit()
@@ -971,7 +1521,10 @@ class WhatsAppAdapter(BasePlatformAdapter):
         *,
         finalize: bool = False,
     ) -> SendResult:
-        """Edit a previously sent message via the WhatsApp bridge."""
+        """Edit a previously sent message via the active WhatsApp backend."""
+        if getattr(self, "_backend", "bridge") not in {"bridge", "node", "legacy"}:
+            return await self._edit_evolution_message(chat_id, message_id, content)
+
         if not self._running or not self._http_session:
             return SendResult(success=False, error="Not connected")
         bridge_exit = await self._check_managed_bridge_exit()
@@ -1004,7 +1557,10 @@ class WhatsAppAdapter(BasePlatformAdapter):
         caption: Optional[str] = None,
         file_name: Optional[str] = None,
     ) -> SendResult:
-        """Send any media file via bridge /send-media endpoint."""
+        """Send any media file via the active WhatsApp backend."""
+        if getattr(self, "_backend", "bridge") not in {"bridge", "node", "legacy"}:
+            return await self._send_media_to_evolution(chat_id, file_path, media_type, caption, file_name)
+
         if not self._running or not self._http_session:
             return SendResult(success=False, error="Not connected")
         bridge_exit = await self._check_managed_bridge_exit()
@@ -1111,6 +1667,17 @@ class WhatsAppAdapter(BasePlatformAdapter):
         """Send typing indicator via bridge."""
         if not self._running or not self._http_session:
             return
+        if getattr(self, "_backend", "bridge") not in {"bridge", "node", "legacy"}:
+            try:
+                await self._evolution_request(
+                    "POST",
+                    "/message/presence",
+                    json_data={"number": chat_id, "state": "composing", "isAudio": False},
+                    timeout=5,
+                )
+            except Exception:
+                pass
+            return
         if await self._check_managed_bridge_exit():
             return
         
@@ -1133,6 +1700,8 @@ class WhatsAppAdapter(BasePlatformAdapter):
         """Get information about a WhatsApp chat."""
         if not self._running or not self._http_session:
             return {"name": "Unknown", "type": "dm"}
+        if getattr(self, "_backend", "bridge") not in {"bridge", "node", "legacy"}:
+            return {"name": chat_id, "type": "group" if str(chat_id).endswith("@g.us") else "dm"}
         if await self._check_managed_bridge_exit():
             return {"name": chat_id, "type": "dm"}
         
