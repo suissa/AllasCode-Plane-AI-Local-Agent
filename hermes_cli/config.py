@@ -205,7 +205,11 @@ _EXTRA_ENV_KEYS = frozenset({
     "IRC_SERVER", "IRC_PORT", "IRC_NICKNAME", "IRC_CHANNEL",
     "IRC_USE_TLS", "IRC_SERVER_PASSWORD", "IRC_NICKSERV_PASSWORD",
     "TERMINAL_ENV", "TERMINAL_SSH_KEY", "TERMINAL_SSH_PORT",
-    "WHATSAPP_MODE", "WHATSAPP_ENABLED",
+    "WHATSAPP_MODE", "WHATSAPP_ENABLED", "WHATSAPP_GATEWAY_BACKEND",
+    "WHATSAPP_EVOLUTION_PORT", "WHATSAPP_EVOLUTION_API_BASE_URL",
+    "WHATSAPP_EVOLUTION_API_KEY", "WHATSAPP_EVOLUTION_INSTANCE_ID",
+    "WHATSAPP_EVOLUTION_INSTANCE_NAME", "WHATSAPP_EVOLUTION_INSTANCE_TOKEN",
+    "WHATSAPP_EVOLUTION_PAIR_PHONE",
     "MATTERMOST_HOME_CHANNEL", "MATTERMOST_HOME_CHANNEL_NAME", "MATTERMOST_REPLY_MODE",
     "MATRIX_PASSWORD", "MATRIX_ENCRYPTION", "MATRIX_DEVICE_ID", "MATRIX_HOME_ROOM",
     "MATRIX_REQUIRE_MENTION", "MATRIX_FREE_RESPONSE_ROOMS", "MATRIX_AUTO_THREAD", "MATRIX_DM_AUTO_THREAD",
@@ -1644,6 +1648,19 @@ DEFAULT_CONFIG = {
 
     # WhatsApp platform settings (gateway mode)
     "whatsapp": {
+        # Backend used by gateway.platforms.whatsapp. Default "evolution"
+        # talks to the bundled Evolution Go API in gateway/platforms/whatsapp/.
+        # Set to "bridge" to temporarily use the legacy Node.js bridge.
+        "backend": "evolution",
+        "service_port": 9991,
+        "api_base_url": "http://127.0.0.1:9991",
+        "instance_id": "hermes",
+        "instance_name": "Hermes",
+        "auto_start": True,
+        "build_on_start": True,
+        "webhook_host": "127.0.0.1",
+        "webhook_port": 9992,
+        "webhook_path": "/webhook/evolution",
         # Reply prefix prepended to every outgoing WhatsApp message.
         # Default (None) uses the built-in "⚕ *Hermes Agent*" header.
         # Set to "" (empty string) to disable the header entirely.
