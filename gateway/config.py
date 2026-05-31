@@ -1097,6 +1097,20 @@ def load_gateway_config() -> GatewayConfig:
                         gaf = ",".join(str(v) for v in gaf)
                     os.environ["WHATSAPP_GROUP_ALLOWED_USERS"] = str(gaf)
 
+                _whatsapp_extra_keys = (
+                    "backend", "implementation", "service_path", "service_port",
+                    "api_base_url", "api_key", "instance_id", "instance_name",
+                    "instance_token", "auto_start", "build_on_start",
+                    "webhook_host", "webhook_port", "webhook_path", "webhook_url",
+                    "pair_phone",
+                )
+                _wa_plat_data, _wa_extra = _ensure_platform_extra_dict(
+                    platforms_data, Platform.WHATSAPP.value
+                )
+                for _key in _whatsapp_extra_keys:
+                    if _key in whatsapp_cfg:
+                        _wa_extra.setdefault(_key, whatsapp_cfg[_key])
+
             # Signal settings → env vars (env vars take precedence)
             signal_cfg = yaml_cfg.get("signal", {})
             if isinstance(signal_cfg, dict):

@@ -85,11 +85,11 @@ def _mock_aiohttp(status=200, json_data=None, json_side_effect=None):
 def _connect_patches(mock_proc, mock_fh, mock_client_cls=None):
     """Return a dict of common patches needed to reach the health-check loop."""
     patches = {
-        "gateway.platforms.whatsapp.check_whatsapp_requirements": True,
+        "gateway.platforms.whatsapp._check_node_requirements": True,
         "gateway.platforms.whatsapp.asyncio.create_task": MagicMock(),
     }
     base = [
-        patch("gateway.platforms.whatsapp.check_whatsapp_requirements", return_value=True),
+        patch("gateway.platforms.whatsapp._check_node_requirements", return_value=True),
         patch.object(Path, "exists", return_value=True),
         patch.object(Path, "mkdir", return_value=None),
         patch("subprocess.run", return_value=MagicMock(returncode=0)),
@@ -223,7 +223,7 @@ class TestConnectCleanup:
 
         install_result = MagicMock(returncode=1, stderr="install failed")
 
-        with patch("gateway.platforms.whatsapp.check_whatsapp_requirements", return_value=True), \
+        with patch("gateway.platforms.whatsapp._check_node_requirements", return_value=True), \
              patch.object(Path, "exists", autospec=True, side_effect=_path_exists), \
              patch("subprocess.run", return_value=install_result), \
              patch("gateway.status.acquire_scoped_lock", return_value=(True, None)), \
@@ -402,7 +402,7 @@ class TestBridgeRuntimeFailure:
 
         mock_fh = MagicMock()
 
-        with patch("gateway.platforms.whatsapp.check_whatsapp_requirements", return_value=True), \
+        with patch("gateway.platforms.whatsapp._check_node_requirements", return_value=True), \
              patch.object(Path, "exists", return_value=True), \
              patch.object(Path, "mkdir", return_value=None), \
              patch("subprocess.run", return_value=MagicMock(returncode=0)), \
@@ -654,7 +654,7 @@ class TestNoCredsPreflight:
         adapter._fatal_error_retryable = True
 
         with patch(
-            "gateway.platforms.whatsapp.check_whatsapp_requirements",
+            "gateway.platforms.whatsapp._check_node_requirements",
             return_value=True,
         ):
             result = await adapter.connect()
@@ -692,7 +692,7 @@ class TestNoCredsPreflight:
         adapter._acquire_platform_lock = MagicMock(return_value=False)
 
         with patch(
-            "gateway.platforms.whatsapp.check_whatsapp_requirements",
+            "gateway.platforms.whatsapp._check_node_requirements",
             return_value=True,
         ):
             result = await adapter.connect()
